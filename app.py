@@ -1,0 +1,155 @@
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+import binascii
+from flask import Flask, request, jsonify
+import requests
+import random
+import uid_generator_pb2
+from zitado_pb2 import Users
+from secret import key, iv
+
+app = Flask(__name__)
+
+def hex_to_bytes(hex_string):
+    return bytes.fromhex(hex_string)
+
+def create_protobuf(akiru_, aditya):
+    message = uid_generator_pb2.uid_generator()
+    message.akiru_ = akiru_
+    message.aditya = aditya
+    return message.SerializeToString()
+
+def protobuf_to_hex(protobuf_data):
+    return binascii.hexlify(protobuf_data).decode()
+
+def decode_hex(hex_string):
+    byte_data = binascii.unhexlify(hex_string.replace(' ', ''))
+    users = Users()
+    users.ParseFromString(byte_data)
+    return users
+
+def encrypt_aes(hex_data, key, iv):
+    key = key.encode()[:16]
+    iv = iv.encode()[:16]
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_data = pad(bytes.fromhex(hex_data), AES.block_size)
+    encrypted_data = cipher.encrypt(padded_data)
+    return binascii.hexlify(encrypted_data).decode()
+
+def get_credentials(region):
+    region = region.upper()
+    if region == "ME":
+        return "3831627617", "CAC2F2F3E2F28C5F5944D502CD171A8AAF84361CDC483E94955D6981F1CFF3E3"
+    elif region in ["SG", "BR", "ME", "US"]:
+        return "3938172433", "ADITYA_FREE_INFO_NA"
+    else:
+        return "3831627617", "ADITYA_FREE_INFO_SG"
+
+def get_jwt_token(region):
+    uid, password = get_credentials(region)
+    jwt_url = f"https://foubia-jwt.vercel.app/GeneRate-Jwt?Uid={uid}&Pw={password}"
+    response = requests.get(jwt_url)
+    if response.status_code != 200:
+        return None
+    return response.json()
+
+@app.route('/player', methods=['GET'])
+def main():
+    uid = request.args.get('uid')
+    region = request.args.get('region')
+
+    if not uid or not region:
+        return jsonify({"error": "Missing 'uid' or 'region' query parameter"}), 400
+
+    try:
+        saturn_ = int(uid)
+    except ValueError:
+        return jsonify({"error": "Invalid UID"}), 400
+
+    jwt_info = get_jwt_token(region)
+    if not jwt_info or 'token' not in jwt_info:
+        return jsonify({"error": "Failed to fetch JWT token"}), 500
+
+    api = jwt_info['serverUrl']
+    token = jwt_info['token']
+
+    protobuf_data = create_protobuf(saturn_, 1)
+    hex_data = protobuf_to_hex(protobuf_data)
+    encrypted_hex = encrypt_aes(hex_data, key, iv)
+
+    headers = {
+        'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)',
+        'Connection': 'Keep-Alive',
+        'Expect': '100-continue',
+        'Authorization': f'Bearer {token}',
+        'X-Unity-Version': '2018.4.11f1',
+        'X-GA': 'v1 1',
+        'ReleaseVersion': 'OB49',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+
+    try:
+        response = requests.post(f"{api}/GetPlayerPersonalShow", headers=headers, data=bytes.fromhex(encrypted_hex))
+        response.raise_for_status()
+    except requests.RequestException:
+        return jsonify({"error": "Failed to contact game server"}), 502
+
+    hex_response = response.content.hex()
+
+    try:
+        users = decode_hex(hex_response)
+    except Exception as e:
+        return jsonify({"error": f"Failed to parse Protobuf: {str(e)}"}), 500
+
+    result = {}
+
+    if users.basicinfo:
+        result['basicinfo'] = []
+        for user_info in users.basicinfo:
+            result['basicinfo'].append({
+                'username': user_info.username,
+                'region': user_info.region,
+                'level': user_info.level,
+                'Exp': user_info.Exp,
+                'bio': users.bioinfo[0].bio if users.bioinfo else None,
+                'banner': user_info.banner,
+                'avatar': user_info.avatar,
+                'brrankscore': user_info.brrankscore,
+                'BadgeCount': user_info.BadgeCount,
+                'likes': user_info.likes,
+                'lastlogin': user_info.lastlogin,
+                'csrankpoint': user_info.csrankpoint,
+                'csrankscore': user_info.csrankscore,
+                'brrankpoint': user_info.brrankpoint,
+                'createat': user_info.createat,
+                'OB': user_info.OB
+            })
+
+    if users.claninfo:
+        result['claninfo'] = []
+        for clan in users.claninfo:
+            result['claninfo'].append({
+                'clanid': clan.clanid,
+                'clanname': clan.clanname,
+                'guildlevel': clan.guildlevel,
+                'livemember': clan.livemember
+            })
+
+    if users.clanadmin:
+        result['clanadmin'] = []
+        for admin in users.clanadmin:
+            result['clanadmin'].append({
+                'idadmin': admin.idadmin,
+                'adminname': admin.adminname,
+                'level': admin.level,
+                'exp': admin.exp,
+                'brpoint': admin.brpoint,
+                'lastlogin': admin.lastlogin,
+                'cspoint': admin.cspoint
+            })
+
+    result['credit'] = '@Xza-team'
+    return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
